@@ -1,0 +1,201 @@
+module axi4_slave (
+    input           clk,
+    input           reset_n,
+
+    // AXI write address channel
+    input  [31:0]   awaddr,
+    input  [7:0]    awlen,
+    input  [2:0]    awsize,
+    input  [1:0]    awburst,
+    input           awvalid,
+    output reg      awready,
+
+    // AXI write data channel
+    input  [31:0]   wdata,
+    input  [3:0]    wstrb,
+    input           wlast,
+    input           wvalid,
+    output reg      wready,
+
+    // AXI write response channel
+    output reg [1:0] bresp,
+    output reg       bvalid,
+    input            bready,
+
+    // AXI read address channel
+    input  [31:0]   araddr,
+    input  [7:0]    arlen,
+    input  [2:0]    arsize,
+    input  [1:0]    arburst,
+    input           arvalid,
+    output reg      arready,
+
+    // AXI read data channel
+    output reg [31:0] rdata,
+    output reg [1:0]  rresp,
+    output reg        rvalid,
+    output reg        rlast,
+    input             rready
+);
+
+// Write FSM states
+localparam WRITE_IDLE   = 2'b00;
+localparam WRITE_ADDR   = 2'b01;
+localparam WRITE_DATA   = 2'b10;
+localparam WRITE_RESP   = 2'b11;
+
+// Read FSM states
+localparam READ_IDLE    = 2'b00;
+localparam READ_ADDR    = 2'b01;
+localparam READ_DATA    = 2'b10;
+
+// FSM registers
+reg [1:0] write_state;
+reg [1:0] read_state;
+
+// Address and burst counters
+reg [31:0] write_address;
+reg [7:0] burst_count;
+reg [31:0] read_address;
+reg [7:0] read_burst_count;
+
+// Memory array (for simplicity)
+reg [31:0] mem [0:255];
+    integer i;
+
+// Burst logic function
+function [31:0] next_address;
+    input [31:0] curr_address;
+    input [1:0]  burst_type;
+    input [2:0]  size;
+  input [31:0]data;
+  
+  $strobe($time,"design data=%0h next_addr=%0h",data,next_address);
+    begin
+        case (burst_type)
+            2'b00: next_address = curr_address; // FIXED
+            2'b01: next_address = curr_address + 1;//(1 << size); // INCREMENTAL
+            2'b10: next_address = {curr_address[31:4], (curr_address[3:0] + (1 << size)) % 16}; // WRAP
+            default: next_address = curr_address;
+        endcase
+    end
+endfunction
+
+// Write FSM
+always @(posedge clk or negedge reset_n) begin
+    if (!reset_n) begin
+      
+        write_state <= WRITE_IDLE;
+        awready <= 1'b0;
+        wready <= 1'b0;
+        bvalid <= 1'b0;
+        bresp <= 2'b00;
+        write_address <= 32'b0;
+        burst_count <= 8'b0;
+      
+      for(i=0;i<=255;i=i+1)
+        begin
+          mem[i]<= 0;
+        end
+    end else begin
+        case (write_state)
+            WRITE_IDLE: begin
+                awready <= awvalid;
+                if (awvalid) begin
+                    write_address <= awaddr;
+                    burst_count <= awlen;
+                    write_state <= WRITE_ADDR;
+                end
+            end
+
+            WRITE_ADDR: begin
+                if (awvalid && awready) begin
+                    awready <= 1'b0;
+                    write_state <= WRITE_DATA;
+                end
+            end
+
+            WRITE_DATA: begin
+                if (wvalid && wready) begin
+                  mem[write_address] <= wdata;
+                  $strobe($time,"design memory data[%0h]= %0h ",write_address-1,mem[write_address-1]);
+                  write_address <= next_address(write_address, awburst, awsize,wdata);
+                    burst_count <= burst_count - 1;
+                    if (burst_count == 0 || wlast) begin
+                        write_state <= WRITE_RESP;
+                      	wready<=0;
+                    end
+                end
+              if(wvalid)
+                wready <=1; //burst_count != 0; // Assert wready if more data expected
+            end
+
+            WRITE_RESP: begin
+              wready<=0;
+                bvalid <= 1'b1;
+                bresp <= 2'b00; // OKAY response
+                if (bready && bvalid) begin
+                    bvalid <= 1'b0;
+                    write_state <= WRITE_IDLE;
+                end
+            end
+        endcase
+    end
+end
+
+
+// Read FSM
+always @(posedge clk or negedge reset_n) begin
+    if (!reset_n) begin
+        read_state <= READ_IDLE;
+        //arready <= 1'b0;
+        rvalid <= 1'b0;
+        rlast <= 1'b0;
+        rresp <= 2'b00;
+      	//arvalid<=0;
+        read_address <= 32'b0;
+        read_burst_count <= 8'b0;
+    end else begin
+        case (read_state)
+            READ_IDLE: begin
+              rdata<=0;
+              rvalid<=0;
+              rlast<=0;
+                arready <= arvalid;
+                if (arvalid) begin
+                    read_address <= araddr;
+                    read_burst_count <= arlen;
+                    read_state <= READ_ADDR;
+                end
+            end
+
+            READ_ADDR: begin
+                if (arvalid && arready) begin
+                    arready <= 1'b0;
+                    read_state <= READ_DATA;
+                end
+            end
+
+            READ_DATA: begin
+                if (rready) begin
+                    // Latch data only when rready is asserted
+                  rdata <= mem[read_address[9:0]]; // Capture data during handshake
+                  read_address <= next_address(read_address, arburst, arsize,32'hff);
+                    read_burst_count <= read_burst_count - 1;
+                    rvalid <= 1'b1;
+                    rlast <= (read_burst_count == 0);
+                    if (read_burst_count == 0) begin
+                        read_state <= READ_IDLE;
+                    end
+                end else begin
+                    rvalid <= 1'b0; // Deassert rvalid if not ready
+                end
+            end
+        endcase
+    end
+end
+
+
+endmodule
+
+
